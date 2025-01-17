@@ -44,7 +44,6 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 public class FlinkDynamicTableFactory
     implements DynamicTableSinkFactory, DynamicTableSourceFactory {
   static final String FACTORY_IDENTIFIER = "iceberg";
-
   private final FlinkCatalog catalog;
 
   public FlinkDynamicTableFactory() {
