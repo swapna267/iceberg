@@ -51,7 +51,7 @@ public class JdbcLockFactory implements TriggerLockFactory {
   private static final int LOCK_ID_MAX_LENGTH = 100;
   private static final String CREATE_LOCK_TABLE_SQL =
       String.format(
-          "CREATE TABLE %s "
+          "CREATE TABLE IF NOT EXISTS %s "
               + "(LOCK_TYPE CHAR(1) NOT NULL, "
               + "LOCK_ID VARCHAR(%s) NOT NULL, "
               + "INSTANCE_ID CHAR(36) NOT NULL, PRIMARY KEY (LOCK_TYPE, LOCK_ID))",

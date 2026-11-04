@@ -35,6 +35,7 @@ import org.apache.flink.streaming.api.graph.StreamGraph;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.types.Row;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.ManifestFile;
@@ -52,9 +53,12 @@ import org.apache.iceberg.flink.SimpleDataUtil;
 import org.apache.iceberg.flink.TestFixtures;
 import org.apache.iceberg.flink.maintenance.api.DeleteOrphanFilesConfig;
 import org.apache.iceberg.flink.maintenance.api.ExpireSnapshotsConfig;
+import org.apache.iceberg.flink.maintenance.api.FlinkMaintenanceConfig;
 import org.apache.iceberg.flink.maintenance.api.LockConfig;
 import org.apache.iceberg.flink.maintenance.api.RewriteDataFilesConfig;
+import org.apache.iceberg.flink.maintenance.operator.ManualSource;
 import org.apache.iceberg.flink.util.FlinkCompatibilityUtil;
+import org.apache.iceberg.io.PositionOutputStream;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -192,7 +196,9 @@ class TestIcebergSinkTableMaintenance extends TestFlinkIcebergSinkBase {
       flinkConf.put(LockConfig.LOCK_TYPE_OPTION.key(), LockConfig.JdbcLockConfig.JDBC);
       flinkConf.put(
           LockConfig.JdbcLockConfig.JDBC_URI_OPTION.key(),
-          "jdbc:sqlite:file::memory:?ic" + UUID.randomUUID().toString().replace("-", ""));
+          "jdbc:sqlite:file::memory:?ic"
+              + UUID.randomUUID().toString().replace("-", "")
+              + "&cache=shared");
       flinkConf.put(LockConfig.LOCK_ID_OPTION.key(), "test-lock-id");
       flinkConf.put(LockConfig.JdbcLockConfig.JDBC_INIT_LOCK_TABLE_OPTION.key(), "true");
     } else {
@@ -311,14 +317,30 @@ class TestIcebergSinkTableMaintenance extends TestFlinkIcebergSinkBase {
         RewriteDataFilesConfig.PREFIX + SizeBasedFileRewritePlanner.REWRITE_ALL, "true");
 
     Map<String, String> expireConfig = Maps.newHashMap();
-    expireConfig.put(ExpireSnapshotsConfig.RETAIN_LAST, "5");
+    expireConfig.put(ExpireSnapshotsConfig.RETAIN_LAST, "1");
+    expireConfig.put(ExpireSnapshotsConfig.MAX_SNAPSHOT_AGE_SECONDS, "1");
+    expireConfig.put(ExpireSnapshotsConfig.SCHEDULE_ON_COMMIT_COUNT, "1");
 
     Map<String, String> orphanConfig = Maps.newHashMap();
-    orphanConfig.put(DeleteOrphanFilesConfig.MIN_AGE_SECONDS, "86400");
+    orphanConfig.put(DeleteOrphanFilesConfig.SCHEDULE_ON_INTERVAL_SECOND, "1");
+    orphanConfig.put(DeleteOrphanFilesConfig.MIN_AGE_SECONDS, "2");
 
-    List<Row> rows = Lists.newArrayList(Row.of(1, "hello"), Row.of(2, "world"), Row.of(3, "foo"));
+    // A file in the table location that no snapshot references
+    String orphanFile = table.location() + "/data/orphan-file.parquet";
+    try (PositionOutputStream out = table.io().newOutputFile(orphanFile).create()) {
+      out.write(new byte[] {1});
+    }
+
+    // The tasks share a lock and are rate limited, so each task runs only after the previous one
+    // has finished and the rate limit has passed. Shorten both delays to see all of them run.
+    flinkConf.put(FlinkMaintenanceConfig.RATE_LIMIT, "1");
+    flinkConf.put(FlinkMaintenanceConfig.LOCK_CHECK_DELAY, "1");
+
+    // A source that stays open, so that the trigger manager timers keep firing.
+    ManualSource<Row> source = new ManualSource<>(env, ROW_TYPE_INFO);
     DataStream<RowData> dataStream =
-        env.addSource(createBoundedSource(rows), ROW_TYPE_INFO)
+        source
+            .dataStream()
             .map(CONVERTER::toInternal, FlinkCompatibilityUtil.toTypeInfo(SimpleDataUtil.ROW_TYPE));
 
     IcebergSink.forRowData(dataStream)
@@ -330,16 +352,39 @@ class TestIcebergSinkTableMaintenance extends TestFlinkIcebergSinkBase {
         .deleteOrphanFiles(orphanConfig)
         .append();
 
-    env.execute("Test All Maintenance E2E");
-
-    table.refresh();
-    // Compaction should have merged the 3 data files into 1
-    List<DataFile> afterCompactDataFiles = getDataFiles(table.currentSnapshot(), table);
-    assertThat(afterCompactDataFiles).hasSize(1);
-
-    List<DataFile> preCompactDataFiles =
-        getDataFiles(table.snapshot(table.currentSnapshot().parentId()), table);
-    assertThat(preCompactDataFiles).hasSize(3);
+    source.sendRecord(Row.of(1, "hello"));
+    source.sendRecord(Row.of(2, "world"));
+    source.sendRecord(Row.of(3, "foo"));
+    JobClient jobClient = env.executeAsync("Test All Maintenance E2E");
+    try {
+      Awaitility.await()
+          .atMost(Duration.ofMinutes(1))
+          .pollInterval(Duration.ofMillis(200))
+          .untilAsserted(
+              () -> {
+                table.refresh();
+                assertThat(table.currentSnapshot()).isNotNull();
+                // Rewrite data files merged the data files into 1
+                assertThat(getDataFiles(table.currentSnapshot(), table)).hasSize(1);
+                // Expire snapshots removed the snapshots that appended the original data files. The
+                // sink keeps adding empty snapshots, so only the ones with data are checked.
+                assertThat(table.snapshots())
+                    .noneMatch(
+                        snapshot ->
+                            DataOperations.APPEND.equals(snapshot.operation())
+                                && snapshot.addedDataFiles(table.io()).iterator().hasNext());
+                // Delete orphan files removed the unreferenced file
+                assertThat(table.io().newInputFile(orphanFile).exists()).isFalse();
+              });
+      SimpleDataUtil.assertTableRecords(
+          table,
+          ImmutableList.of(
+              SimpleDataUtil.createRecord(1, "hello"),
+              SimpleDataUtil.createRecord(2, "world"),
+              SimpleDataUtil.createRecord(3, "foo")));
+    } finally {
+      jobClient.cancel();
+    }
   }
 
   @ParameterizedTest(name = "lockType = {0}")
