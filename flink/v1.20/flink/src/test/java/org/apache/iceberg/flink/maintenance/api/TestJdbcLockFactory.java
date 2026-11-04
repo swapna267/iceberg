@@ -22,15 +22,25 @@ import static org.apache.iceberg.flink.maintenance.api.JdbcLockFactory.INIT_LOCK
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.nio.file.Path;
 import java.sql.SQLTransientConnectionException;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.jdbc.JdbcCatalog;
 import org.apache.iceberg.jdbc.JdbcClientPool;
 import org.apache.iceberg.jdbc.UncheckedSQLException;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class TestJdbcLockFactory extends TestLockFactoryBase {
   @Override
@@ -44,6 +54,51 @@ class TestJdbcLockFactory extends TestLockFactoryBase {
         "jdbc:sqlite:file::memory:?ic" + UUID.randomUUID().toString().replace("-", ""),
         tableName,
         properties);
+  }
+
+  @Test
+  void testConcurrentLockTableInitialization(@TempDir Path tempDir) throws Exception {
+    // The trigger manager and the lock remover both create the lock table when they are opened, so
+    // opening several factories at the same time on a new database must not fail
+    int concurrentFactories = 4;
+    int rounds = 20;
+    Map<String, String> properties = Maps.newHashMap();
+    properties.put(JdbcCatalog.PROPERTY_PREFIX + "username", "user");
+    properties.put(JdbcCatalog.PROPERTY_PREFIX + "password", "password");
+    properties.put(INIT_LOCK_TABLES_PROPERTY, "true");
+
+    List<Throwable> failures = Collections.synchronizedList(Lists.newArrayList());
+    ExecutorService executor = Executors.newFixedThreadPool(concurrentFactories);
+    try {
+      for (int round = 0; round < rounds; ++round) {
+        String uri = "jdbc:sqlite:" + tempDir.resolve("lock-" + round + ".db");
+        CyclicBarrier barrier = new CyclicBarrier(concurrentFactories);
+        List<Future<?>> opened = Lists.newArrayList();
+        for (int i = 0; i < concurrentFactories; ++i) {
+          opened.add(
+              executor.submit(
+                  () -> {
+                    JdbcLockFactory factory = new JdbcLockFactory(uri, "lock-id", properties);
+                    barrier.await();
+                    factory.open();
+                    factory.close();
+                    return null;
+                  }));
+        }
+
+        for (Future<?> future : opened) {
+          try {
+            future.get();
+          } catch (ExecutionException e) {
+            failures.add(e.getCause());
+          }
+        }
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+
+    assertThat(failures).isEmpty();
   }
 
   @Test
